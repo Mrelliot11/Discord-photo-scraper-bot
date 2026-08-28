@@ -28,6 +28,9 @@ yarn-error.log*
 .env*.local
 .env
 
+# downloaded photo backups
+/backups/
+
 # vercel
 .vercel
 

@@ -1,0 +1,17 @@
+{
+  "name": "discord-photo-scraper-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that scrapes a channel's images by user and backs them up into a zip archive.",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy-commands": "node src/deployCommands.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
