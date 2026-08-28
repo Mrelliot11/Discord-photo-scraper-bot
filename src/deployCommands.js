@@ -4,6 +4,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { REST, Routes } = require('discord.js');
+const { buildMinimalInviteURL } = require('./lib/security');
 
 const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID } = process.env;
 
@@ -30,6 +31,8 @@ const rest = new REST().setToken(DISCORD_TOKEN);
     console.log(
       `Registered ${data.length} command(s) ${DISCORD_GUILD_ID ? `to guild ${DISCORD_GUILD_ID}` : 'globally'}.`
     );
+    console.log('\nMinimal-permission invite link (use this, not "Administrator"):');
+    console.log(buildMinimalInviteURL(DISCORD_CLIENT_ID));
   } catch (err) {
     console.error('Failed to register commands:', err);
     process.exit(1);

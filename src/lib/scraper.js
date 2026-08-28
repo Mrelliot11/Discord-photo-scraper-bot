@@ -3,8 +3,11 @@
 const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
+const { isAllowedAttachmentUrl } = require('./security');
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.svg']);
+
+class BackupLimitExceededError extends Error {}
 
 function isImageAttachment(attachment) {
   if (attachment.contentType && attachment.contentType.startsWith('image/')) return true;
@@ -71,12 +74,36 @@ async function scanChannelForImageAuthors(channel, { maxMessages, onProgress } =
   return authors;
 }
 
+const DEFAULT_MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES) || 25 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BACKUP_BYTES = Number(process.env.MAX_TOTAL_BACKUP_BYTES) || 500 * 1024 * 1024;
+
+/** Ensures a zip entry name can never escape the archive root (defense in depth on top of path.basename below). */
+function assertSafeEntryName(entryName) {
+  const normalized = entryName.replace(/\\/g, '/');
+  if (normalized.includes('/') || normalized.includes('..')) {
+    throw new Error(`Refusing unsafe zip entry name: ${entryName}`);
+  }
+}
+
 /**
  * Downloads every image attachment in a channel authored by `authorId`
  * (or every author if `authorId` is null) and zips them into `outputPath`.
- * Returns { fileCount, zipPath, zipSizeBytes }.
+ * Enforces a per-file size cap, a total-backup size cap, and only ever
+ * fetches from Discord's own CDN hosts, so a malicious or huge disguised
+ * "image" can't exhaust the host's disk or be used to pull data from an
+ * arbitrary URL. Returns { fileCount, zipPath, zipSizeBytes, skipped }.
  */
-async function backupChannelImages(channel, authorId, outputPath, { maxMessages, onProgress } = {}) {
+async function backupChannelImages(
+  channel,
+  authorId,
+  outputPath,
+  {
+    maxMessages,
+    onProgress,
+    maxAttachmentBytes = DEFAULT_MAX_ATTACHMENT_BYTES,
+    maxTotalBytes = DEFAULT_MAX_TOTAL_BACKUP_BYTES,
+  } = {}
+) {
   await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
 
   const output = fs.createWriteStream(outputPath);
@@ -91,46 +118,80 @@ async function backupChannelImages(channel, authorId, outputPath, { maxMessages,
 
   let fileCount = 0;
   let scanned = 0;
+  let totalBytes = 0;
+  let skipped = 0;
   const usedNames = new Set();
 
-  for await (const batch of iterateChannelMessages(channel, { maxMessages })) {
-    for (const message of batch.values()) {
-      scanned += 1;
-      if (authorId && message.author.id !== authorId) continue;
+  try {
+    for await (const batch of iterateChannelMessages(channel, { maxMessages })) {
+      for (const message of batch.values()) {
+        scanned += 1;
+        if (authorId && message.author.id !== authorId) continue;
 
-      const imageAttachments = [...message.attachments.values()].filter(isImageAttachment);
-      for (const attachment of imageAttachments) {
-        const response = await fetch(attachment.url);
-        if (!response.ok) continue;
-        const buffer = Buffer.from(await response.arrayBuffer());
+        const imageAttachments = [...message.attachments.values()].filter(isImageAttachment);
+        for (const attachment of imageAttachments) {
+          if (!isAllowedAttachmentUrl(attachment.url)) {
+            skipped += 1;
+            continue;
+          }
+          if (attachment.size && attachment.size > maxAttachmentBytes) {
+            skipped += 1;
+            continue;
+          }
 
-        const ext = path.extname(attachment.name || '') || '.png';
-        const base = path.basename(attachment.name || attachment.id, ext);
-        let entryName = `${message.createdTimestamp}_${base}${ext}`;
-        let dedupeSuffix = 1;
-        while (usedNames.has(entryName)) {
-          entryName = `${message.createdTimestamp}_${base}_${dedupeSuffix}${ext}`;
-          dedupeSuffix += 1;
+          const response = await fetch(attachment.url);
+          if (!response.ok) {
+            skipped += 1;
+            continue;
+          }
+          const buffer = Buffer.from(await response.arrayBuffer());
+          if (buffer.length > maxAttachmentBytes) {
+            skipped += 1;
+            continue;
+          }
+
+          if (totalBytes + buffer.length > maxTotalBytes) {
+            throw new BackupLimitExceededError(
+              `Total backup size exceeded the ${maxTotalBytes}-byte limit; stopped after ${fileCount} image(s).`
+            );
+          }
+          totalBytes += buffer.length;
+
+          const ext = path.extname(attachment.name || '') || '.png';
+          const base = path.basename(attachment.name || attachment.id, ext);
+          let entryName = `${message.createdTimestamp}_${base}${ext}`;
+          let dedupeSuffix = 1;
+          while (usedNames.has(entryName)) {
+            entryName = `${message.createdTimestamp}_${base}_${dedupeSuffix}${ext}`;
+            dedupeSuffix += 1;
+          }
+          assertSafeEntryName(entryName);
+          usedNames.add(entryName);
+
+          archive.append(buffer, { name: entryName });
+          fileCount += 1;
         }
-        usedNames.add(entryName);
-
-        archive.append(buffer, { name: entryName });
-        fileCount += 1;
       }
-    }
 
-    if (onProgress) onProgress({ scanned, fileCount });
+      if (onProgress) onProgress({ scanned, fileCount, totalBytes, skipped });
+    }
+  } catch (err) {
+    archive.abort();
+    output.destroy();
+    await fs.promises.rm(outputPath, { force: true });
+    throw err;
   }
 
   await archive.finalize();
   await closed;
 
   const stats = await fs.promises.stat(outputPath);
-  return { fileCount, zipPath: outputPath, zipSizeBytes: stats.size };
+  return { fileCount, zipPath: outputPath, zipSizeBytes: stats.size, skipped };
 }
 
 module.exports = {
   isImageAttachment,
   scanChannelForImageAuthors,
   backupChannelImages,
+  BackupLimitExceededError,
 };

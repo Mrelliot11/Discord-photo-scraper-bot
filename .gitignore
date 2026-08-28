@@ -31,6 +31,9 @@ yarn-error.log*
 # downloaded photo backups
 /backups/
 
+# audit log of backup actions
+/logs/
+
 # vercel
 .vercel
 
