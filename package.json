@@ -4,9 +4,13 @@
   "description": "Discord bot that scrapes a channel's images by user and backs them up into a zip archive.",
   "type": "commonjs",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=18.17"
+  },
   "scripts": {
     "start": "node src/index.js",
-    "deploy-commands": "node src/deployCommands.js"
+    "deploy-commands": "node src/deployCommands.js",
+    "test": "node --test"
   },
   "license": "MIT",
   "dependencies": {

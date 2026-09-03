@@ -76,13 +76,50 @@ async function scanChannelForImageAuthors(channel, { maxMessages, onProgress } =
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES) || 25 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BACKUP_BYTES = Number(process.env.MAX_TOTAL_BACKUP_BYTES) || 500 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 30 * 1000;
 
-/** Ensures a zip entry name can never escape the archive root (defense in depth on top of path.basename below). */
-function assertSafeEntryName(entryName) {
-  const normalized = entryName.replace(/\\/g, '/');
-  if (normalized.includes('/') || normalized.includes('..')) {
-    throw new Error(`Refusing unsafe zip entry name: ${entryName}`);
+/**
+ * Makes an attachment's file name safe to use as a zip entry: strips path
+ * separators (both kinds, since path.basename only understands the host
+ * OS's), control characters, and leading dots. Never throws — a weird
+ * filename must not abort a whole backup.
+ */
+function safeEntryBaseName(name, fallback) {
+  const cleaned = String(name || '')
+    .replace(/[\\/\x00-\x1f]/g, '_')
+    .replace(/^\.+/, '')
+    .trim();
+  return cleaned || fallback;
+}
+
+class AttachmentTooLargeError extends Error {}
+
+/**
+ * Downloads a URL into a Buffer, giving up as soon as the body exceeds
+ * `maxBytes` (rather than buffering the whole thing first) or the request
+ * exceeds DOWNLOAD_TIMEOUT_MS.
+ */
+async function downloadCapped(url, maxBytes) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw new AttachmentTooLargeError();
   }
+
+  const chunks = [];
+  let received = 0;
+  for await (const chunk of response.body) {
+    received += chunk.length;
+    if (received > maxBytes) {
+      await response.body.cancel().catch(() => {});
+      throw new AttachmentTooLargeError();
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 /**
@@ -102,6 +139,7 @@ async function backupChannelImages(
     onProgress,
     maxAttachmentBytes = DEFAULT_MAX_ATTACHMENT_BYTES,
     maxTotalBytes = DEFAULT_MAX_TOTAL_BACKUP_BYTES,
+    isAllowedUrl = isAllowedAttachmentUrl,
   } = {}
 ) {
   await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
@@ -130,7 +168,7 @@ async function backupChannelImages(
 
         const imageAttachments = [...message.attachments.values()].filter(isImageAttachment);
         for (const attachment of imageAttachments) {
-          if (!isAllowedAttachmentUrl(attachment.url)) {
+          if (!isAllowedUrl(attachment.url)) {
             skipped += 1;
             continue;
           }
@@ -139,13 +177,15 @@ async function backupChannelImages(
             continue;
           }
 
-          const response = await fetch(attachment.url);
-          if (!response.ok) {
-            skipped += 1;
-            continue;
-          }
-          const buffer = Buffer.from(await response.arrayBuffer());
-          if (buffer.length > maxAttachmentBytes) {
+          let buffer;
+          try {
+            buffer = await downloadCapped(attachment.url, maxAttachmentBytes);
+          } catch (err) {
+            // Oversized, timed out, or a bad HTTP status: skip this one file
+            // and keep going rather than failing the whole backup.
+            if (!(err instanceof AttachmentTooLargeError)) {
+              console.warn(`Skipping attachment ${attachment.id}: ${err.message}`);
+            }
             skipped += 1;
             continue;
           }
@@ -157,15 +197,15 @@ async function backupChannelImages(
           }
           totalBytes += buffer.length;
 
-          const ext = path.extname(attachment.name || '') || '.png';
-          const base = path.basename(attachment.name || attachment.id, ext);
+          const safeName = safeEntryBaseName(attachment.name, attachment.id);
+          const ext = path.extname(safeName) || '.png';
+          const base = path.basename(safeName, ext) || attachment.id;
           let entryName = `${message.createdTimestamp}_${base}${ext}`;
           let dedupeSuffix = 1;
           while (usedNames.has(entryName)) {
             entryName = `${message.createdTimestamp}_${base}_${dedupeSuffix}${ext}`;
             dedupeSuffix += 1;
           }
-          assertSafeEntryName(entryName);
           usedNames.add(entryName);
 
           archive.append(buffer, { name: entryName });
@@ -176,8 +216,19 @@ async function backupChannelImages(
       if (onProgress) onProgress({ scanned, fileCount, totalBytes, skipped });
     }
   } catch (err) {
+    // Tear down cleanly: stop the archive feeding the file, swallow the
+    // stream errors that teardown itself produces (otherwise `closed`
+    // rejects with nobody awaiting it and the process dies with an
+    // unhandled rejection), wait for the file handle to close, then
+    // remove the partial zip.
+    closed.catch(() => {});
+    archive.unpipe(output);
     archive.abort();
-    output.destroy();
+    await new Promise((resolve) => {
+      if (output.closed || output.destroyed) return resolve();
+      output.once('close', resolve);
+      output.destroy();
+    });
     await fs.promises.rm(outputPath, { force: true });
     throw err;
   }
