@@ -22,8 +22,9 @@ const REQUIRED_PERMISSIONS = [
  * include any of these, the bot refuses to operate until an admin removes
  * them. This is a denylist rather than a strict allowlist because Discord's
  * default @everyone role already grants harmless extras (reactions,
- * nicknames, voice) that every bot inherits — a strict allowlist would block
- * the bot in almost every real server.
+ * nicknames, voice, Create Invite, Mention Everyone) that every bot
+ * inherits — a strict allowlist would block the bot in almost every real
+ * server. Nothing that is on by default for @everyone belongs in this list.
  */
 const DANGEROUS_PERMISSIONS = [
   PermissionFlagsBits.Administrator,
@@ -40,12 +41,13 @@ const DANGEROUS_PERMISSIONS = [
   PermissionFlagsBits.ManageEvents,
   PermissionFlagsBits.ManageThreads,
   PermissionFlagsBits.ViewAuditLog,
-  PermissionFlagsBits.MentionEveryone,
-  PermissionFlagsBits.CreateInstantInvite,
   PermissionFlagsBits.DeafenMembers,
   PermissionFlagsBits.MuteMembers,
   PermissionFlagsBits.MoveMembers,
 ];
+
+/** Old names discord.js still exports for the same bit; never report these. */
+const DEPRECATED_PERMISSION_ALIASES = new Set(['ManageEmojisAndStickers']);
 
 /** Only fetch/proxy attachments from Discord's own CDN hosts. */
 const ALLOWED_ATTACHMENT_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
@@ -65,7 +67,11 @@ function buildMinimalInviteURL(clientId) {
 }
 
 function nameOfPermission(flag) {
-  return Object.entries(PermissionFlagsBits).find(([, value]) => value === flag)?.[0] ?? String(flag);
+  return (
+    Object.entries(PermissionFlagsBits).find(
+      ([name, value]) => value === flag && !DEPRECATED_PERMISSION_ALIASES.has(name)
+    )?.[0] ?? String(flag)
+  );
 }
 
 function findDangerousPermissions(permissions) {
@@ -90,7 +96,19 @@ async function auditGuildPermissions(guild) {
   // happen at any moment and this check exists specifically to catch that.
   const me = await guild.members.fetchMe({ force: true });
   const excess = findDangerousPermissions(me.permissions);
-  return { safe: excess.length === 0, excess, scope: 'guild-role' };
+  return { safe: excess.length === 0, excess, scope: 'guild-role', member: me };
+}
+
+/**
+ * Runs both the guild-role and channel-level audits and returns the first
+ * unsafe result, or null when both are clean. `channel` may be null.
+ */
+async function auditBotPermissions(guild, channel) {
+  const guildAudit = await auditGuildPermissions(guild);
+  if (!guildAudit.safe) return guildAudit;
+  if (!channel) return null;
+  const channelAudit = auditChannelPermissions(channel, guildAudit.member);
+  return channelAudit.safe ? null : channelAudit;
 }
 
 /** Checks the bot's effective, resolved permissions in one specific channel. */
@@ -116,5 +134,6 @@ module.exports = {
   findDangerousPermissions,
   auditGuildPermissions,
   auditChannelPermissions,
+  auditBotPermissions,
   isAllowedAttachmentUrl,
 };

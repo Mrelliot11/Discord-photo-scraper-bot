@@ -22,31 +22,37 @@ up their images (or everyone's) into a zip file for storage.
    - Under **Bot**, enable the **Message Content Intent** (required to read attachments on messages the bot didn't send).
    - Copy the bot token and the application's Client ID.
 
-2. **Invite the bot to your server**
-   - Run `npm run deploy-commands` (step 5) first — it prints a ready-to-use invite link built from the exact minimal permission set the bot needs (`View Channels`, `Read Message History`, `Send Messages`, `Attach Files`, `Embed Links`). Use that link.
-   - If building the link by hand instead, in **OAuth2 > URL Generator** select the `bot` and `applications.commands` scopes, and grant only those same permissions.
-   - **Never grant `Administrator`** or broad moderation permissions (Manage Server/Roles/Channels, Kick/Ban/Timeout Members, Manage Webhooks, etc.) — the bot doesn't need them, and it will refuse to run `/backup` in any server where it detects them (see **Security Model** below).
-
-3. **Configure environment variables**
+2. **Configure environment variables**
    ```bash
    cp .env.example .env
    ```
    Fill in `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, and (recommended during development) `DISCORD_GUILD_ID` for your test server so slash commands register instantly.
 
-4. **Install dependencies**
+3. **Install dependencies** (Node 18.17 or newer)
    ```bash
    npm install
    ```
 
-5. **Register the slash command**
+4. **Register the slash command and get your invite link**
    ```bash
    npm run deploy-commands
    ```
+   This registers `/backup` and prints a ready-to-use invite link built from the exact minimal permission set the bot needs (`View Channels`, `Read Message History`, `Send Messages`, `Attach Files`, `Embed Links`).
+
+5. **Invite the bot to your server**
+   - Open the invite link printed in the previous step.
+   - If building the link by hand instead, in **OAuth2 > URL Generator** select the `bot` and `applications.commands` scopes, and grant only those same permissions.
+   - **Never grant `Administrator`** or broad moderation permissions (Manage Server/Roles/Channels, Kick/Ban/Timeout Members, Manage Webhooks, etc.) — the bot doesn't need them, and it will refuse to run `/backup` in any server where it detects them (see **Security Model** below).
 
 6. **Run the bot**
    ```bash
    npm start
    ```
+
+To run the unit tests (mocked Discord objects, no token needed):
+```bash
+npm test
+```
 
 ## Usage
 
@@ -93,7 +99,9 @@ bot to backing up a channel:
   (`REQUIRED_PERMISSIONS`) and a list of permissions it should never hold
   (`DANGEROUS_PERMISSIONS`: Administrator, Manage Server/Roles/Channels,
   Kick/Ban/Timeout Members, Manage Webhooks/Messages, View Audit Log, and
-  more).
+  more). Permissions Discord turns on for `@everyone` by default (Create
+  Invite, Mention Everyone, reactions, voice) are deliberately not on that
+  list, so the guard doesn't false-positive on a normally configured server.
 - On login, and whenever the bot joins a new server, it checks its actual
   granted permissions and logs a warning naming exactly which dangerous
   permission(s) are present, if any.
@@ -114,11 +122,14 @@ bot to backing up a channel:
   (`cdn.discordapp.com` / `media.discordapp.net`); anything else is skipped.
 - Per-file (`MAX_ATTACHMENT_BYTES`) and total-backup (`MAX_TOTAL_BACKUP_BYTES`)
   size caps stop a disguised huge "image" or a huge channel from exhausting
-  the host's memory or disk — a run that hits the total cap discards the
-  partial zip rather than leaving a truncated one behind.
-- Zip entry names are built from `path.basename()` of the attachment name
-  and explicitly checked to reject any path separators or `..`, so a
-  crafted filename can't zip-slip its way outside the archive.
+  the host's memory or disk. Downloads are streamed and cut off the moment
+  they pass the per-file cap, and each has a 30-second timeout. A run that
+  hits the total cap discards the partial zip rather than leaving a
+  truncated one behind.
+- Zip entry names have every path separator (forward and back slash),
+  control character, and leading dot stripped before use, so a crafted
+  filename can't zip-slip outside the archive. A weird filename or a failed
+  download skips that one file; it never aborts the whole backup.
 - Every backup's output path is resolved and verified to stay inside
   `backups/` before anything is written.
 - A per-server lock (`src/lib/concurrencyLock.js`) stops two `/backup` runs
